@@ -1,14 +1,20 @@
+import torch
 import numpy as np
 import supervision as sv
 import cv2
 import matplotlib.pyplot as plt
+import math
 
 from osgeo import gdal, ogr
 import geopandas as gpd
 from shapely.geometry import Point, Polygon
 from segment_anything import sam_model_registry, SamAutomaticMaskGenerator, SamPredictor
+from scipy.spatial import cKDTree
+from tqdm.notebook import tqdm
 
 from typing import List, Tuple
+
+DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 def pixel_to_geo(geotransform, x, y):
     geo_x = geotransform[0] + x * geotransform[1] + y * geotransform[2]
@@ -30,8 +36,9 @@ def load_geotif(image_path):
 
     return dataset, geotransform, projection
 
-def load_sam_model(checkpoint_path):
-    sam = sam_model_registry["vit_h"](checkpoint_path)
+def load_sam_model(checkpoint_path, device=DEVICE):
+    print(f"Using device: {device}")
+    sam = sam_model_registry["vit_h"](checkpoint_path).to(device)
     mask_generator = SamAutomaticMaskGenerator(sam)
     return mask_generator
 
@@ -57,7 +64,7 @@ def process_tile(tile: np.ndarray, mask_generator: SamAutomaticMaskGenerator) ->
     sam_result = mask_generator.generate(tile_rgb)
     return sam_result
 
-def process_geotif_with_sam_tiled(image_path, sam_checkpoint_path, tile_size: int = 1024, overlap: int = 100):
+def process_geotif_with_sam_tiled(image_path, sam_checkpoint_path, shapefilename, tile_size: int = 1024, overlap: int = 100):
     dataset, geotransform, projection = load_geotif(image_path)
     if dataset is None:
         return
@@ -70,17 +77,21 @@ def process_geotif_with_sam_tiled(image_path, sam_checkpoint_path, tile_size: in
     print("Image size:", width, height)
     print("Number of bands:", bands)
 
-    all_detections = []
-    all_geo_located_detections = []
+    all_polygons = []
+    all_car_polygons = []
+    all_car_centroids = []
 
-    full_image = dataset.ReadAsArray()
+    num_tiles_x = math.ceil(width / (tile_size - overlap))
+    num_tiles_y = math.ceil(height / (tile_size - overlap))
+    total_tiles = num_tiles_x * num_tiles_y
+    print(f"Number of tiles: {num_tiles_x} x {num_tiles_y} = {total_tiles}")
 
-    if bands > 1:
-        full_image = np.transpose(full_image, (1, 2, 0))
-    full_image_rgb = preprocess_for_sam(full_image)
+    pbar = tqdm(total=total_tiles, desc="Processing tiles", unit="tile")
 
-    for y in range(0, height, tile_size - overlap):
-        for x in range(0, width, tile_size - overlap):
+    for i in range(num_tiles_y):
+        for j in range(num_tiles_x):
+            x = j * (tile_size - overlap)
+            y = i * (tile_size - overlap)
             tile_width = min(tile_size, width - x)
             tile_height = min(tile_size, height - y)
             tile = dataset.ReadAsArray(x, y, tile_width, tile_height)
@@ -88,30 +99,51 @@ def process_geotif_with_sam_tiled(image_path, sam_checkpoint_path, tile_size: in
             if bands > 1:
                 tile = np.transpose(tile, (1, 2, 0))
 
+            sam_start_time = cv2.getTickCount()
+
             sam_result = process_tile(tile, mask_generator)
+
+            sam_end_time = cv2.getTickCount()
+            sam_time = (sam_end_time - sam_start_time) / cv2.getTickFrequency()
+            print(f"Tile {i * num_tiles_x + j + 1}/{total_tiles} processed in {sam_time:.2f} seconds")
 
             detections = sv.Detections.from_sam(sam_result=sam_result)
 
-            detections.xyxy[:, [0, 2]] += x
-            detections.xyxy[:, [1, 3]] += y
+            polygon_geometries = []
 
-            all_detections.append(detections)
+            for mask in detections.mask:
+                mask_uint8 = mask.astype(np.uint8)
+                contours, _ = cv2.findContours(mask_uint8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                for contour in contours:
+                    if len(contour) >= 3:
+                        polygon = [tuple(point[0]) for point in contour]
+                        # Adjust polygon coordinates to the tile's position in the full image
+                        adjusted_polygon = [(p[0] + x, p[1] + y) for p in polygon]
+                        geo_coords = convert_polygon_coordinates(adjusted_polygon, geotransform)
+                        if len(geo_coords) >= 3:
+                            polygon = Polygon(geo_coords)
+                            if polygon.is_valid:
+                                polygon_geometries.append(polygon)
 
-            for bbox in detections.xyxy:
-                x1, y1, x2, y2 = bbox
-                center_x = (x1 + x2) / 2
-                center_y = (y1 + y2) / 2
-                geo_x, geo_y = pixel_to_geo(geotransform, center_x, center_y)
-                all_geo_located_detections.append((geo_x, geo_y))
+            tile_car_polygons = filter_car_polygons_aerial(polygon_geometries)
+            tile_car_centroids = [polygon.centroid for polygon in tile_car_polygons]
 
-    combined_detections = sv.Detections.merge(all_detections)
+            all_polygons.extend(polygon_geometries)
+            all_car_polygons.extend(tile_car_polygons)
+            all_car_centroids.extend(tile_car_centroids)
 
-    mask_annotator = sv.MaskAnnotator(color_lookup=sv.ColorLookup.INDEX)
-    annotated_image = mask_annotator.annotate(scene=full_image_rgb.copy(), detections=combined_detections)
+            pbar.update(1)
 
-    return combined_detections, all_geo_located_detections, dataset, annotated_image
+    pbar.close()
 
-def process_geotif_single_tile(image_path, sam_checkpoint_path, tile_size: int = 1024):
+    save_features_to_shapefile(all_polygons, projection, f"image_data/{shapefilename}_all_polygons")
+    save_features_to_shapefile(all_car_polygons, projection, f"image_data/{shapefilename}_car_polygons")
+    save_features_to_shapefile(all_car_centroids, projection, f"image_data/{shapefilename}_car_centroids")
+
+    return all_car_polygons, all_car_centroids, dataset, projection
+
+
+def process_geotif_single_tile(image_path, sam_checkpoint_path, shapefilename, tile_size: int = 1024):
     dataset, geotransform, projection = load_geotif(image_path)
     if dataset is None:
         return
@@ -133,15 +165,14 @@ def process_geotif_single_tile(image_path, sam_checkpoint_path, tile_size: int =
 
     detections = sv.Detections.from_sam(sam_result=sam_result)
 
-    centroid_points = []
     polygon_geometries = []
 
-    for bbox in detections.xyxy:
-        x1, y1, x2, y2 = bbox
-        center_x = (x1 + x2) / 2
-        center_y = (y1 + y2) / 2
-        geo_x, geo_y = pixel_to_geo(geotransform, center_x, center_y)
-        centroid_points.append(Point(geo_x, geo_y))
+    # for bbox in detections.xyxy:
+    #     x1, y1, x2, y2 = bbox
+    #     center_x = (x1 + x2) / 2
+    #     center_y = (y1 + y2) / 2
+    #     geo_x, geo_y = pixel_to_geo(geotransform, center_x, center_y)
+    #     centroid_points.append(Point(geo_x, geo_y))
 
     for mask in detections.mask:
         mask_uint8 = mask.astype(np.uint8)
@@ -156,17 +187,22 @@ def process_geotif_single_tile(image_path, sam_checkpoint_path, tile_size: int =
                     if polygon.is_valid:
                         polygon_geometries.append(polygon)
 
-    centroids_gdf = gpd.GeoDataFrame(geometry=centroid_points, crs=projection)
-    polygons_gdf = gpd.GeoDataFrame(geometry=polygon_geometries, crs=projection)
+    all_centroids = [polygon.centroid for polygon in polygon_geometries]
 
-    return detections, centroids_gdf, polygons_gdf, tile, dataset, polygon_geometries, projection
+    car_polygons = filter_car_polygons_aerial(polygon_geometries)
+    car_centroids = [polygon.centroid for polygon in car_polygons]
+
+    save_features_to_shapefile(car_polygons, projection, f"image_data/{shapefilename}_polygons")
+    save_features_to_shapefile(car_centroids, projection, f"image_data/{shapefilename}_centroids")
+
+    return car_polygons, polygon_geometries, car_centroids, all_centroids, detections, tile, dataset, projection
 
 def save_features_to_shapefile(features, projection, output_path):
     gdf = gpd.GeoDataFrame(geometry=features, crs=projection)
     gdf.to_file(output_path, driver="ESRI Shapefile")
     print(f"GeoDataFrame saved to {output_path}")
 
-def filter_car_polygons_aerial(polygons, min_aspect_ratio=1.5, max_aspect_ratio=2.2, min_area=7, max_area=20, min_rectangularity=0.75):
+def filter_car_polygons_aerial(polygons, min_aspect_ratio=1, max_aspect_ratio=2.7, min_area=7, max_area=30, min_rectangularity=0.8, max_circularity=0.85):
     car_polygons = []
     for polygon in polygons:
         # Get the minimum rotated bounding rectangle
@@ -189,9 +225,13 @@ def filter_car_polygons_aerial(polygons, min_aspect_ratio=1.5, max_aspect_ratio=
         area = rotated_bbox.area
         rectangularity = polygon_area / area
 
+        perimeter = polygon.length
+        circularity = 4 * np.pi * polygon_area / (perimeter ** 2)
+
         if (min_aspect_ratio <= aspect_ratio <= max_aspect_ratio and
             min_area <= area <= max_area and
-            rectangularity >= min_rectangularity):  # Adjust this threshold as needed
+            rectangularity >= min_rectangularity and
+            circularity <= max_circularity):  # Adjust this threshold as needed
             car_polygons.append(polygon)
 
     return car_polygons
@@ -213,7 +253,7 @@ def visualize_detections_on_image(image_array, detections, save_path=None):
 
     return annotated_image
 
-def visualize_filtered_cars(image_array, all_polygons, filtered_polygons, min_aspect_ratio, max_aspect_ratio, min_area, max_area):
+def visualize_filtered_cars(image_array, filtered_polygons):
     # Preprocess the image for display
     image_rgb = preprocess_for_sam(image_array)
 
@@ -223,18 +263,13 @@ def visualize_filtered_cars(image_array, all_polygons, filtered_polygons, min_as
     # Display the image
     ax.imshow(image_rgb)
 
-    # Plot all polygons in red
-    for poly in all_polygons:
-        x, y = poly.exterior.xy
-        ax.plot(x, y, color='red', alpha=0.6, linewidth=1, solid_capstyle='round', zorder=1)
-
     # Plot filtered polygons in green
     for poly in filtered_polygons:
         x, y = poly.exterior.xy
         ax.plot(x, y, color='green', alpha=0.8, linewidth=2, solid_capstyle='round', zorder=2)
 
     # Set title with current parameters
-    ax.set_title(f"Filtered Cars\nAspect Ratio: {min_aspect_ratio}-{max_aspect_ratio}, Area: {min_area}-{max_area}")
+    ax.set_title(f"{len(filtered_polygons)} filtered car polygons")
 
     # Remove axis labels
     ax.set_axis_off()
@@ -242,6 +277,66 @@ def visualize_filtered_cars(image_array, all_polygons, filtered_polygons, min_as
     # Show the plot
     plt.tight_layout()
     plt.show()
+
+def compare_geotif_outputs(
+    polygons1: List[Polygon],
+    centroids1: List[Point],
+    polygons2: List[Polygon],
+    centroids2: List[Point],
+    distance_threshold: float = 1.0
+) -> dict:
+    """
+    Compare two sets of polygon geometries and centroids from process_geotif_single_tile outputs.
+
+    :param polygons1: List of Shapely Polygons from the first image
+    :param centroids1: List of Shapely Points (centroids) from the first image
+    :param polygons2: List of Shapely Polygons from the second image
+    :param centroids2: List of Shapely Points (centroids) from the second image
+    :param distance_threshold: Maximum distance to consider centroids as matching
+    :return: Dictionary containing matched and unmatched polygons and centroids
+    """
+    # Convert centroids to numpy arrays for KDTree
+    centroids1_array = np.array([(c.x, c.y) for c in centroids1])
+    centroids2_array = np.array([(c.x, c.y) for c in centroids2])
+
+    # Build KDTree for faster nearest neighbor search
+    tree = cKDTree(centroids2_array)
+
+    matched_indices = []
+    unmatched_indices1 = []
+    unmatched_indices2 = set(range(len(centroids2)))
+
+    for i, centroid in enumerate(centroids1_array):
+        distance, j = tree.query(centroid, k=1)
+        if distance < distance_threshold:
+            matched_indices.append((i, j))
+            if j in unmatched_indices2:
+                unmatched_indices2.remove(j)
+        else:
+            unmatched_indices1.append(i)
+
+    # Prepare the results
+    matched_polygons_1 = [polygons1[i] for i, _ in matched_indices]
+    matched_polygons_2 = [polygons2[j] for _, j in matched_indices]
+    matched_centroids_1 = [centroids1[i] for i, _ in matched_indices]
+    matched_centroids_2 = [centroids2[j] for _, j in matched_indices]
+
+    unmatched_polygons1 = [polygons1[i] for i in unmatched_indices1]
+    unmatched_centroids1 = [centroids1[i] for i in unmatched_indices1]
+
+    unmatched_polygons2 = [polygons2[i] for i in unmatched_indices2]
+    unmatched_centroids2 = [centroids2[i] for i in unmatched_indices2]
+
+    return {
+        'matched_polygons_1': matched_polygons_1,
+        'matched_centroids_1': matched_centroids_1,
+        'matched_polygons_2': matched_polygons_2,
+        'matched_centroids_2': matched_centroids_2,
+        'unmatched_polygons1': unmatched_polygons1,
+        'unmatched_centroids1': unmatched_centroids1,
+        'unmatched_polygons2': unmatched_polygons2,
+        'unmatched_centroids2': unmatched_centroids2
+    }
 
 # def create_df_from_detections(detections, geotransform, projection):
 #     polygon_geometries = []
